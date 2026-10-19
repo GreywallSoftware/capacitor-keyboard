@@ -42,7 +42,6 @@ typedef enum : NSUInteger {
 @property (nonatomic, readwrite) int paddingBottom;
 @property (nonatomic, readwrite) NSTimeInterval pendingAnimationDuration;
 @property (nonatomic, readwrite) UIViewAnimationOptions pendingAnimationOptions;
-@property (nonatomic, strong) UIView *resizeSnapshot;
 @property (nonatomic, strong) UIColor *backdropColor;
 
 @end
@@ -334,8 +333,11 @@ double stageManagerOffset;
     height = 0.0;
   }
 
-  double duration = [[notification.userInfo valueForKey:UIKeyboardAnimationDurationUserInfoKey] doubleValue]+0.2;
-  [self setKeyboardHeight:(int)height delay:duration];
+  // Resize on the keyboard's own animation. The upstream
+  // `delay:(duration + 0.2)` shrinks the webview only after the keyboard has
+  // fully settled, so an input near the bottom stays under the keyboard — and
+  // its caret out of sight — until well after the keyboard has finished opening.
+  [self setKeyboardHeight:(int)height withAnimationFromNotification:notification];
   [self resetScrollView];
 
   NSString * data = [NSString stringWithFormat:@"{ 'keyboardHeight': %d }", (int)height];
@@ -435,55 +437,6 @@ double stageManagerOffset;
   [self performSelector:action withObject:nil afterDelay:0 inModes:@[NSRunLoopCommonModes]];
 }
 
-/**
- Cover the web surface with a still image of itself for the length of the resize.
-
- WKWebView renders out of process: changing its frame is synchronous, but the
- relayout and repaint at the new size arrive later over IPC. In between, the
- compositor has regions it must draw and no tile for, so it falls back to the
- layer's base colour and a band flashes. No choice of background colour removes
- that — it only changes the band's colour — because the band is missing CONTENT,
- not a missing colour.
-
- Holding a snapshot over the top means nothing unpainted is ever on screen. It
- stays opaque for the whole resize and only cross-dissolves afterwards, once
- WebKit has shipped tiles for the new size — fading in step with the resize
- leaves it partly transparent while tiles are still missing, and the band shows
- through.
-
- Installed on the shrink only. See `_animateFrameUpdate`.
- */
-- (void)_installResizeSnapshot
-{
-  [self _removeResizeSnapshot];
-
-  UIView *host = self.webView.superview;
-  if (host == nil || self.webView.bounds.size.height <= 0.0) {
-    return;
-  }
-
-  // afterScreenUpdates:NO — snapshot what is already on screen. YES would force a
-  // synchronous render pass and defeat the point.
-  UIView *snapshot = [self.webView snapshotViewAfterScreenUpdates:NO];
-  if (snapshot == nil) {
-    return;
-  }
-
-  snapshot.frame = self.webView.frame;
-  // The webview shrinks underneath; the snapshot must keep its original size so
-  // it continues to cover the area being vacated.
-  snapshot.autoresizingMask = UIViewAutoresizingNone;
-  snapshot.userInteractionEnabled = NO;
-  [host insertSubview:snapshot aboveSubview:self.webView];
-  self.resizeSnapshot = snapshot;
-}
-
-- (void)_removeResizeSnapshot
-{
-  [self.resizeSnapshot removeFromSuperview];
-  self.resizeSnapshot = nil;
-}
-
 - (void)_animateFrameUpdate
 {
   // Hardware keyboard attach/detach and some Stage Manager transitions report a
@@ -493,41 +446,19 @@ double stageManagerOffset;
     return;
   }
 
-  // Only the shrink needs covering. Growing back, the snapshot is shorter than
-  // the final frame by construction, so it cannot cover the band being revealed
-  // — it can only hold a stale image over content that has already relaid out,
-  // which is the COCKPIT bar and message rows showing twice mid-screen. The
-  // revealed band needs no cover either: it shows the webview background, which
-  // `forceBackdropColor:` has set to the page colour.
-  if (self.paddingBottom > 0) {
-    [self _installResizeSnapshot];
-  }
-
+  // The live webview stays on screen for the whole resize. Covering it with a
+  // snapshot hides any band WebKit has not repainted yet, but the snapshot is
+  // taken before focus lands, so it also freezes the focused input without its
+  // caret until the keyboard has finished — the keyboard then visibly opens
+  // first and the cursor appears after it. Not-yet-painted regions instead show
+  // the webview background, which `forceBackdropColor:` sets to the page colour.
   [UIView animateWithDuration:self.pendingAnimationDuration
                         delay:0.0
                       options:self.pendingAnimationOptions
                    animations:^{
                      [self _updateFrame];
                    }
-                   completion:^(BOOL finished) {
-                     // Cross-dissolve AFTER the resize, not across it. Fading in
-                     // step with the frame change leaves the snapshot partly
-                     // transparent while WebKit is still shipping tiles for the
-                     // new size, so an unpainted band shows through at partial
-                     // alpha. It reads as a white flash wherever the page is not
-                     // white — i.e. the header strip under the status bar.
-                     // Holding alpha at 1 until the resize is done means nothing
-                     // unpainted is ever on screen; by here WebKit has had the
-                     // whole keyboard animation to paint, so the dissolve reveals
-                     // finished content.
-                     [UIView animateWithDuration:0.1
-                                      animations:^{
-                                        self.resizeSnapshot.alpha = 0.0;
-                                      }
-                                      completion:^(BOOL done) {
-                                        [self _removeResizeSnapshot];
-                                      }];
-                   }];
+                   completion:nil];
 }
 
 - (void)setKeyboardHeight:(int)height delay:(NSTimeInterval)delay
