@@ -44,19 +44,23 @@ declare module '@capacitor/cli' {
 
       /**
        * Controls how the keyboard backdrop color (the area visible behind the
-       * keyboard) is set every time the keyboard is about to show.
+       * keyboard, and any part of the WebView not yet repainted during a
+       * resize) is set every time the keyboard is about to show or hide.
        *
        * - `'off'` — Do not tint the backdrop.
        * - `'auto'` — Use the `backgroundColor` set in the Capacitor config;
-       *   otherwise derive the color from the web app's DOM body background.
-       * - `'dom'` — Always derive the color from the web app's DOM body
-       *   background, ignoring the `backgroundColor` config. If the DOM
-       *   has no resolvable background, the backdrop is left untouched.
+       *   otherwise derive the color from the web app's DOM.
+       * - `'dom'` — Always derive the color from the web app's DOM (the first
+       *   non-transparent background at the bottom edge of the viewport,
+       *   falling back to the body), ignoring the `backgroundColor` config. If
+       *   the DOM has no resolvable background, the backdrop is left untouched.
+       *
+       * Defaults to `'dom'` when `resize` is `'native'`, `'off'` otherwise.
        *
        * Only available on iOS.
        *
        * @since 8.0.4
-       * @default "off"
+       * @default "off" ("dom" with native resize)
        * @example "auto"
        */
       autoBackdropColor?: 'off' | 'auto' | 'dom';

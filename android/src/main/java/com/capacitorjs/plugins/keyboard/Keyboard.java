@@ -2,22 +2,15 @@ package com.capacitorjs.plugins.keyboard;
 
 import android.content.Context;
 import android.graphics.Rect;
-import android.os.Build;
-import android.util.DisplayMetrics;
-import android.util.TypedValue;
 import android.view.View;
 import android.view.Window;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.FrameLayout;
-import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
-import androidx.core.view.WindowInsetsAnimationCompat;
 import androidx.core.view.WindowInsetsCompat;
 import com.getcapacitor.Bridge;
-import java.util.List;
 
 public class Keyboard {
 
@@ -31,6 +24,8 @@ public class Keyboard {
     private int usableHeightPrevious;
     private FrameLayout.LayoutParams frameLayoutParams;
     private View mChildOfContent;
+    private boolean keyboardVisible;
+    private int keyboardHeight;
 
     public void setKeyboardEventListener(@Nullable KeyboardEventListener keyboardEventListener) {
         this.keyboardEventListener = keyboardEventListener;
@@ -58,6 +53,21 @@ public class Keyboard {
         FrameLayout content = activity.getWindow().getDecorView().findViewById(android.R.id.content);
         rootView = content.getRootView();
 
+        // Keyboard state is read from window insets only. Do NOT register a
+        // WindowInsetsAnimationCallback anywhere in the hierarchy: as soon as the
+        // decor view has one, InsetsController stops running the IME animation on
+        // its dedicated InsetsAnimationThread and drives it from the UI thread
+        // instead (AOSP InsetsController#applyAnimation:
+        // `!hasAnimationCallbacks || skipsCallbacks /* useInsetsAnimationThread */`).
+        // In a WebView app the UI thread is at its busiest exactly when an input
+        // gains focus (focus dispatch, IME connection, evaluateJavascript, the
+        // resize relayout), so the keyboard starts late and stutters behind the
+        // caret. Without a callback the system animates the IME off the UI thread.
+        //
+        // Nothing is lost: with adjustResize, InsetsController lays the window out
+        // with the END state for the whole animation, on show and on hide
+        // (LAYOUT_INSETS_DURING_ANIMATION_SHOWN / _HIDDEN), so the inset change
+        // arrives here when the animation starts — the moment the WebView resizes.
         ViewCompat.setOnApplyWindowInsetsListener(content, (v, insets) -> {
             WindowInsetsCompat rootInsets = ViewCompat.getRootWindowInsets(rootView);
             if (rootInsets == null) return insets;
@@ -68,69 +78,49 @@ public class Keyboard {
                 possiblyResizeChildOfContent(showingKeyboard);
             }
 
+            notifyKeyboardState(showingKeyboard, rootInsets.getInsets(WindowInsetsCompat.Type.ime()).bottom);
+
             v.onApplyWindowInsets(insets.toWindowInsets());
 
             return insets;
         });
 
-        ViewCompat.setWindowInsetsAnimationCallback(
-            rootView,
-            new WindowInsetsAnimationCompat.Callback(WindowInsetsAnimationCompat.Callback.DISPATCH_MODE_STOP) {
-                @NonNull
-                @Override
-                public WindowInsetsCompat onProgress(
-                    @NonNull WindowInsetsCompat insets,
-                    @NonNull List<WindowInsetsAnimationCompat> runningAnimations
-                ) {
-                    return insets;
-                }
-
-                @NonNull
-                @Override
-                public WindowInsetsAnimationCompat.BoundsCompat onStart(
-                    @NonNull WindowInsetsAnimationCompat animation,
-                    @NonNull WindowInsetsAnimationCompat.BoundsCompat bounds
-                ) {
-                    WindowInsetsCompat insets = ViewCompat.getRootWindowInsets(rootView);
-                    if (insets == null) return super.onStart(animation, bounds);
-                    boolean showingKeyboard = insets.isVisible(WindowInsetsCompat.Type.ime());
-                    int imeHeight = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom;
-                    DisplayMetrics dm = activity.getResources().getDisplayMetrics();
-                    final float density = dm.density;
-
-                    if (resizeOnFullScreen) {
-                        possiblyResizeChildOfContent(showingKeyboard);
-                    }
-
-                    if (showingKeyboard) {
-                        keyboardEventListener.onKeyboardEvent(EVENT_KB_WILL_SHOW, Math.round(imeHeight / density));
-                    } else {
-                        keyboardEventListener.onKeyboardEvent(EVENT_KB_WILL_HIDE, 0);
-                    }
-                    return super.onStart(animation, bounds);
-                }
-
-                @Override
-                public void onEnd(@NonNull WindowInsetsAnimationCompat animation) {
-                    super.onEnd(animation);
-                    WindowInsetsCompat insets = ViewCompat.getRootWindowInsets(rootView);
-                    if (insets == null) return;
-                    boolean showingKeyboard = insets.isVisible(WindowInsetsCompat.Type.ime());
-                    int imeHeight = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom;
-                    DisplayMetrics dm = activity.getResources().getDisplayMetrics();
-                    final float density = dm.density;
-
-                    if (showingKeyboard) {
-                        keyboardEventListener.onKeyboardEvent(EVENT_KB_DID_SHOW, Math.round(imeHeight / density));
-                    } else {
-                        keyboardEventListener.onKeyboardEvent(EVENT_KB_DID_HIDE, 0);
-                    }
-                }
-            }
-        );
-
         mChildOfContent = content.getChildAt(0);
         frameLayoutParams = (FrameLayout.LayoutParams) mChildOfContent.getLayoutParams();
+    }
+
+    /**
+     * Emit keyboard events when the IME visibility or height actually changes.
+     * Insets are re-applied for many unrelated reasons (system bars, rotation,
+     * SystemBars padding), so repeats are dropped.
+     *
+     * The "will" and "did" events are emitted together: the layout they describe
+     * is already final when the insets arrive (see the constructor), so a
+     * `keyboardDidShow` handler that measures or scrolls sees the resized
+     * viewport. This matches the pre-WindowInsetsAnimation Android implementation.
+     */
+    private void notifyKeyboardState(boolean imeVisible, int imeHeightPx) {
+        // At the start of a hide the layout already uses the hidden (zero) inset
+        // while the IME may still report visible; a zero-height keyboard is hidden.
+        boolean visible = imeVisible && imeHeightPx > 0;
+        float density = activity.getResources().getDisplayMetrics().density;
+        int height = visible ? Math.round(imeHeightPx / density) : 0;
+        if (visible == keyboardVisible && height == keyboardHeight) {
+            return;
+        }
+        keyboardVisible = visible;
+        keyboardHeight = height;
+
+        if (keyboardEventListener == null) {
+            return;
+        }
+        if (visible) {
+            keyboardEventListener.onKeyboardEvent(EVENT_KB_WILL_SHOW, height);
+            keyboardEventListener.onKeyboardEvent(EVENT_KB_DID_SHOW, height);
+        } else {
+            keyboardEventListener.onKeyboardEvent(EVENT_KB_WILL_HIDE, 0);
+            keyboardEventListener.onKeyboardEvent(EVENT_KB_DID_HIDE, 0);
+        }
     }
 
     public void show() {
