@@ -40,8 +40,6 @@ typedef enum : NSUInteger {
 @property (nonatomic, readwrite) ResizePolicy keyboardResizes;
 @property (readwrite, assign, nonatomic) NSString* keyboardStyle;
 @property (nonatomic, readwrite) int paddingBottom;
-@property (nonatomic, readwrite) NSTimeInterval pendingAnimationDuration;
-@property (nonatomic, readwrite) UIViewAnimationOptions pendingAnimationOptions;
 @property (nonatomic, strong) UIColor *backdropColor;
 
 @end
@@ -333,7 +331,7 @@ double stageManagerOffset;
     height = 0.0;
   }
 
-  // Resize on the keyboard's own animation. The upstream
+  // Resize as soon as the keyboard starts to open. The upstream
   // `delay:(duration + 0.2)` shrinks the webview only after the keyboard has
   // fully settled, so an input near the bottom stays under the keyboard — and
   // its caret out of sight — until well after the keyboard has finished opening.
@@ -387,22 +385,25 @@ double stageManagerOffset;
 }
 
 /**
- Resize the web surface on the keyboard's OWN animation, instead of snapping the
- frame after the keyboard has already finished moving.
+ Resize the web surface as soon as the keyboard starts to move, in one step and
+ WITHOUT animation.
 
  Upstream (through 8.0.5 and 9.0.0-next.1) does
- `setKeyboardHeight:delay:(keyboardDuration + 0.2)`, which lands an unanimated
- `-setFrame:` roughly 200ms after the keyboard is fully up. That late, instant
- frame change is the visible jump — see ionic-team/capacitor-keyboard#79.
+ `setKeyboardHeight:delay:(keyboardDuration + 0.2)`, so the webview shrinks only
+ after the keyboard has fully settled: an input near the bottom stays under the
+ keyboard, and its caret out of sight, until well after the keyboard is up.
 
- UIKit reports the in-flight animation's duration and curve on the notification,
- so joining it is exact rather than an approximation.
+ The frame must not be animated either. WKWebView lays its content out at the
+ final size immediately while only the layer's position interpolates, so the
+ page visibly slides in from the bottom with a black/white band above it.
+ Snapping the frame at willShow lets WebKit scroll the focused field into view
+ while the keyboard is still rising, as on Android. The band the keyboard has
+ not reached yet shows the window background, which `forceBackdropColor:` paints
+ with the page colour.
  */
 - (void)setKeyboardHeight:(int)height withAnimationFromNotification:(NSNotification *)notification
 {
-  // Only ResizeNative moves a UIView frame, which is the only thing UIView
-  // animation can interpolate. ResizeBody/ResizeIonic drive layout through a JS
-  // eval and keep the original delayed path.
+  // ResizeBody/ResizeIonic drive layout through a JS eval.
   if (self.keyboardResizes != ResizeNative) {
     [self setKeyboardHeight:height delay:0.01];
     return;
@@ -413,52 +414,24 @@ double stageManagerOffset;
   }
   self.paddingBottom = height;
 
-  NSNumber *durationValue = [notification.userInfo valueForKey:UIKeyboardAnimationDurationUserInfoKey];
-  NSNumber *curveValue = [notification.userInfo valueForKey:UIKeyboardAnimationCurveUserInfoKey];
-
-  self.pendingAnimationDuration = durationValue ? [durationValue doubleValue] : 0.0;
-  // UIKit packs the keyboard's private curve into UIViewAnimationOptions by
-  // shifting it left 16 bits. This is what puts the web surface on exactly the
-  // keyboard's curve rather than a default ease-in-out.
-  // No UIViewAnimationOptionLayoutSubviews: WKWebView lays out its own scroll
-  // view and content view, and forcing a layout pass on them every animation
-  // frame is not needed to move the frame.
-  self.pendingAnimationOptions = (UIViewAnimationOptions)([curveValue integerValue] << 16)
-    | UIViewAnimationOptionBeginFromCurrentState;
-
   // afterDelay:0 defers to the next run loop turn rather than running inline.
   // That is load-bearing: moving focus between two fields whose keyboards differ
   // emits willHide and willShow in the SAME turn, and the cancel below then drops
   // the hide so the surface never bounces to full height and back. It is the same
   // coalescing the upstream `delay:0.01` provided, kept intact.
-  SEL action = @selector(_animateFrameUpdate);
+  SEL action = @selector(_snapFrameUpdate);
   [NSObject cancelPreviousPerformRequestsWithTarget:self selector:action object:nil];
   [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(_updateFrame) object:nil];
   [self performSelector:action withObject:nil afterDelay:0 inModes:@[NSRunLoopCommonModes]];
 }
 
-- (void)_animateFrameUpdate
+- (void)_snapFrameUpdate
 {
-  // Hardware keyboard attach/detach and some Stage Manager transitions report a
-  // zero duration: there is no animation to join, so resize outright.
-  if (self.pendingAnimationDuration <= 0.0) {
+  // Keyboard notifications are delivered inside UIKit's keyboard animation, and
+  // a frame change made in that context can be picked up by it. Opt out.
+  [UIView performWithoutAnimation:^{
     [self _updateFrame];
-    return;
-  }
-
-  // The live webview stays on screen for the whole resize. Covering it with a
-  // snapshot hides any band WebKit has not repainted yet, but the snapshot is
-  // taken before focus lands, so it also freezes the focused input without its
-  // caret until the keyboard has finished — the keyboard then visibly opens
-  // first and the cursor appears after it. Not-yet-painted regions instead show
-  // the webview background, which `forceBackdropColor:` sets to the page colour.
-  [UIView animateWithDuration:self.pendingAnimationDuration
-                        delay:0.0
-                      options:self.pendingAnimationOptions
-                   animations:^{
-                     [self _updateFrame];
-                   }
-                   completion:nil];
+  }];
 }
 
 - (void)setKeyboardHeight:(int)height delay:(NSTimeInterval)delay
